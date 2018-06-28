@@ -20,6 +20,14 @@ namespace arookas.jolt {
 		Track[] mChannelTracks;
 		bool[] mChannelOpen;
 
+        private List<Tuple<string, int>> usedInstrumentVars;
+        private List<Tuple<string, int>> usedBankVars;
+
+        private bool[] hasBankControl;
+        private bool[] hasMoreThan1Instrument;
+        private List<int>[] usedInstruments;
+
+
 		public JoltErrand() {
 			mRootTrack = new Track();
 			mChannelTracks = new Track[16];
@@ -28,7 +36,16 @@ namespace arookas.jolt {
 			}
 			mChannelOpen = new bool[16];
 			mLoop = -1;
-		}
+
+            hasBankControl = new bool[16];
+            for (var i = 0; i < 16; i++) {
+                hasBankControl[i] = false;
+            }
+
+            usedInstrumentVars = new List<Tuple<string, int>>();
+            usedBankVars = new List<Tuple<string, int>>();
+
+        }
 
 		public void LoadParams(string[] arguments) {
 			var cmdline = new aCommandLine(arguments);
@@ -100,6 +117,7 @@ namespace arookas.jolt {
 		}
 
 		public void Perform() {
+
 			using (var instream = mareep.OpenFile(mInput)) {
 				LoadMidi(instream);
 
@@ -130,15 +148,32 @@ namespace arookas.jolt {
 
 				WriteSeparator();
 				mWriter.WriteLine();
-				mWriter.WriteLine("ROOT_TRACK_BEGIN:");
-				for (var i = 0; i < 16; ++i) {
+
+                mWriter.WriteLine(".define DEFAULT_INSTRUMENT_BANK 0b");
+                mWriter.WriteLine();
+
+                foreach (Tuple<string, int> banktuple in usedBankVars) {
+                    mWriter.WriteLine(".define {0} {1}b", banktuple.Item1, banktuple.Item2);
+                }
+
+                mWriter.WriteLine();
+
+                foreach (Tuple<string, int> instrumenttuple in usedInstrumentVars) {
+                    mWriter.WriteLine(".define {0} {1}b", instrumenttuple.Item1, instrumenttuple.Item2);
+                }
+
+                mWriter.WriteLine();
+                mWriter.WriteLine("ROOT_TRACK_BEGIN:");
+                for (var i = 0; i < 16; ++i) {
 					if (!mChannelOpen[i]) {
 						continue;
 					}
 
-					mWriter.WriteLine("opentrack {0}, @TRACK_{0}_BEGIN", i);
+                    mWriter.WriteLine("opentrack {0}, @TRACK_{0}_BEGIN", i);
 				}
-				mWriter.WriteLine();
+
+
+                mWriter.WriteLine();
 				mWriter.WriteLine("timebase {0}h", Division);
 				mWriter.WriteLine("load rpitch, 2b");
 				mWriter.WriteLine();
@@ -160,6 +195,11 @@ namespace arookas.jolt {
 					mWriter.WriteLine();
 					mWriter.WriteLine("TRACK_{0}_BEGIN:", i);
 					mWriter.WriteLine("synccpu 0");
+
+                    if (!hasBankControl[i]) {
+                        mWriter.WriteLine("load rbank, DEFAULT_INSTRUMENT_BANK");
+                    }
+
 					mChannelTracks[i].Write(mWriter);
 					mWriter.WriteLine("TRACK_{0}_END:", i);
 					mWriter.WriteLine();
@@ -194,7 +234,10 @@ namespace arookas.jolt {
 				}
 			}
 
+            var j = 0;
+
 			for (var i = 0; i < TrackCount; ++i) {
+                //Console.WriteLine(String.Format("Hello! {0}", i));
 				GotoTrack(i);
 
 				var time = 0L;
@@ -205,8 +248,8 @@ namespace arookas.jolt {
 					switch (ev.type) {
 						case EventType.NoteOn: ReadNoteOn(time, ev); break;
 						case EventType.NoteOff: ReadNoteOff(time, ev); break;
-						case EventType.ControlChange: ReadControlChange(time, ev); break;
-						case EventType.ProgramChange: ReadProgramChange(time, ev); break;
+						case EventType.ControlChange: ReadControlChange(time, ev, j); break;
+						case EventType.ProgramChange: ReadProgramChange(time, ev, j); break;
 						case EventType.PitchWheel: ReadPitchWheel(time, ev); break;
 						case EventType.Meta: {
 							switch (ev.metatype) {
@@ -222,6 +265,9 @@ namespace arookas.jolt {
 						}
 					}
 				}
+                if (mChannelOpen[i]) {
+                    j++;
+                }
 			}
 
 			var finalcommand = (mLoop >= 0 ? "jmp @LOOP" : "finish");
@@ -251,25 +297,46 @@ namespace arookas.jolt {
 			mChannelOpen[ev.channel] = true;
 		}
 
-		void ReadControlChange(long time, EventInfo ev) {
+		void ReadControlChange(long time, EventInfo ev, int i) {
 			var open = true;
 
 			switch (ev.controller) {
 				case 7: mChannelTracks[ev.channel].AddEvent(time, "timedparam 0, {0}s", ev.value); break;
 				case 10: mChannelTracks[ev.channel].AddEvent(time, "timedparam 3, {0}s", ev.value); break;
-				case 32: mChannelTracks[ev.channel].AddEvent(time, "load rbank, {0}b", ev.value); break;
+                case 32: {
+                        string bankvar = String.Format("TRACK_{0}_BANK_{1}", ev.channel, ev.value);
+                        Tuple<string, int> banktuple = Tuple.Create<string, int>(bankvar, ev.value);
+
+                        hasBankControl[i] = true;
+
+                        if (!usedBankVars.Contains(banktuple)) {
+                            usedBankVars.Add(banktuple);
+                        }
+
+                        mChannelTracks[ev.channel].AddEvent(time, "load rbank, {0}", bankvar);
+
+                        break;
+                    }
 				default: open = false; break;
 			}
 
 			mChannelOpen[ev.channel] |= open;
 		}
 
-		void ReadProgramChange(long time, EventInfo ev) {
+		void ReadProgramChange(long time, EventInfo ev, int i) {
 			var program = ev.program;
 			if (ev.channel == 10) {
 				program = (228 + (program % 12));
 			}
-			mChannelTracks[ev.channel].AddEvent(time, "load rprogram, {0}b", program);
+            //Console.WriteLine(i);
+            string instrumentvar = String.Format("TRACK_{0}_INSTRUMENT_{1}", ev.channel, program);
+            Tuple<string, int> instrumenttuple = Tuple.Create<string, int>(instrumentvar, program);
+
+            if (!usedInstrumentVars.Contains(instrumenttuple)) {
+                usedInstrumentVars.Add(instrumenttuple);
+            }
+
+            mChannelTracks[ev.channel].AddEvent(time, "load rprogram, {0}", instrumentvar);
 			mChannelOpen[ev.channel] = true;
 		}
 
